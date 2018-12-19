@@ -29,7 +29,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-import tokenization
+import tokenization_ch
 from modeling import BertConfig, BertModel
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s', 
@@ -171,7 +171,7 @@ def read_examples(input_file):
     unique_id = 0
     with open(input_file, "r") as reader:
         while True:
-            line = tokenization.convert_to_unicode(reader.readline())
+            line = tokenization_ch.convert_to_unicode(reader.readline())
             if not line:
                 break
             line = line.strip()
@@ -216,6 +216,10 @@ def main():
                         type=int,
                         default=-1,
                         help = "local_rank for distributed training on gpus")
+    parser.add_argument("--no_cuda",#mjj,2018.11.14
+                        type=int,
+                        default=0,
+                        help="whether use cuda")
 
     args = parser.parse_args()
 
@@ -227,13 +231,13 @@ def main():
         n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl')
-    logger.info("device", device, "n_gpu", n_gpu, "distributed training", bool(args.local_rank != -1))
+    # logger.info("device", device, "n_gpu", n_gpu, "distributed training", bool(args.local_rank != -1))
 
     layer_indexes = [int(x) for x in args.layers.split(",")]
 
     bert_config = BertConfig.from_json_file(args.bert_config_file)
 
-    tokenizer = tokenization.FullTokenizer(
+    tokenizer = tokenization_ch.FullTokenizer(
         vocab_file=args.vocab_file, do_lower_case=args.do_lower_case)
 
     examples = read_examples(args.input_file)
@@ -274,7 +278,7 @@ def main():
             input_mask = input_mask.to(device)
 
             all_encoder_layers, _ = model(input_ids, token_type_ids=None, attention_mask=input_mask)
-            all_encoder_layers = all_encoder_layers
+            all_encoder_layers = all_encoder_layers#?????
 
             for b, example_index in enumerate(example_indices):
                 feature = features[example_index.item()]

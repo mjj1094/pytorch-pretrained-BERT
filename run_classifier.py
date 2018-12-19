@@ -30,7 +30,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-import tokenization
+import tokenization_ch
 from modeling import BertConfig, BertForSequenceClassification
 from optimization import BERTAdam
 
@@ -122,9 +122,9 @@ class MrpcProcessor(DataProcessor):
             if i == 0:
                 continue
             guid = "%s-%s" % (set_type, i)
-            text_a = tokenization.convert_to_unicode(line[3])
-            text_b = tokenization.convert_to_unicode(line[4])
-            label = tokenization.convert_to_unicode(line[0])
+            text_a = tokenization_ch.convert_to_unicode(line[3])
+            text_b = tokenization_ch.convert_to_unicode(line[4])
+            label = tokenization_ch.convert_to_unicode(line[0])
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
@@ -154,10 +154,10 @@ class MnliProcessor(DataProcessor):
         for (i, line) in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, tokenization.convert_to_unicode(line[0]))
-            text_a = tokenization.convert_to_unicode(line[8])
-            text_b = tokenization.convert_to_unicode(line[9])
-            label = tokenization.convert_to_unicode(line[-1])
+            guid = "%s-%s" % (set_type, tokenization_ch.convert_to_unicode(line[0]))
+            text_a = tokenization_ch.convert_to_unicode(line[8])
+            text_b = tokenization_ch.convert_to_unicode(line[9])
+            label = tokenization_ch.convert_to_unicode(line[-1])
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
@@ -185,8 +185,8 @@ class ColaProcessor(DataProcessor):
         examples = []
         for (i, line) in enumerate(lines):
             guid = "%s-%s" % (set_type, i)
-            text_a = tokenization.convert_to_unicode(line[3])
-            label = tokenization.convert_to_unicode(line[1])
+            text_a = tokenization_ch.convert_to_unicode(line[3])
+            label = tokenization_ch.convert_to_unicode(line[1])
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
         return examples
@@ -273,7 +273,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
             logger.info("tokens: %s" % " ".join(
-                    [tokenization.printable_text(x) for x in tokens]))
+                    [tokenization_ch.printable_text(x) for x in tokens]))
             logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
             logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
             logger.info(
@@ -308,32 +308,6 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 def accuracy(out, labels):
     outputs = np.argmax(out, axis=1)
     return np.sum(outputs==labels)
-
-def copy_optimizer_params_to_model(named_params_model, named_params_optimizer):
-    """ Utility function for optimize_on_cpu and 16-bits training.
-        Copy the parameters optimized on CPU/RAM back to the model on GPU
-    """
-    for (name_opti, param_opti), (name_model, param_model) in zip(named_params_optimizer, named_params_model):
-        if name_opti != name_model:
-            logger.error("name_opti != name_model: {} {}".format(name_opti, name_model))
-            raise ValueError
-        param_model.data.copy_(param_opti.data)
-
-def set_optimizer_params_grad(named_params_optimizer, named_params_model, test_nan=False):
-    """ Utility function for optimize_on_cpu and 16-bits training.
-        Copy the gradient of the GPU parameters to the CPU/RAMM copy of the model
-    """
-    is_nan = False
-    for (name_opti, param_opti), (name_model, param_model) in zip(named_params_optimizer, named_params_model):
-        if name_opti != name_model:
-            logger.error("name_opti != name_model: {} {}".format(name_opti, name_model))
-            raise ValueError
-        if test_nan and torch.isnan(param_model.grad).sum() > 0:
-            is_nan = True
-        if param_opti.grad is None:
-            param_opti.grad = torch.nn.Parameter(param_opti.data.new().resize_(*param_opti.data.size()))
-        param_opti.grad.data.copy_(param_model.grad.data)
-    return is_nan
 
 def main():
     parser = argparse.ArgumentParser()
@@ -418,6 +392,10 @@ def main():
                         default=False,
                         action='store_true',
                         help="Whether not to use CUDA when available")
+    parser.add_argument("--accumulate_gradients",
+                        type=int,
+                        default=1,
+                        help="Number of steps to accumulate gradient on (divide the batch_size and accumulate)")
     parser.add_argument("--local_rank",
                         type=int,
                         default=-1,
@@ -430,18 +408,6 @@ def main():
                         type=int,
                         default=1,
                         help="Number of updates steps to accumualte before performing a backward/update pass.")                       
-    parser.add_argument('--optimize_on_cpu',
-                        default=False,
-                        action='store_true',
-                        help="Whether to perform optimization and keep the optimizer averages on CPU")
-    parser.add_argument('--fp16',
-                        default=False,
-                        action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--loss_scale',
-                        type=float, default=128,
-                        help='Loss scaling, positive power of 2 values can improve fp16 convergence.')
-
     args = parser.parse_args()
 
     processors = {
@@ -458,16 +424,13 @@ def main():
         n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl')
-        if args.fp16:
-            logger.info("16-bits training currently not supported in distributed training")
-            args.fp16 = False # (see https://github.com/pytorch/pytorch/pull/13496)
     logger.info("device %s n_gpu %d distributed training %r", device, n_gpu, bool(args.local_rank != -1))
 
-    if args.gradient_accumulation_steps < 1:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
-                            args.gradient_accumulation_steps))
+    if args.accumulate_gradients < 1:
+        raise ValueError("Invalid accumulate_gradients parameter: {}, should be >= 1".format(
+                            args.accumulate_gradients))
 
-    args.train_batch_size = int(args.train_batch_size / args.gradient_accumulation_steps)
+    args.train_batch_size = int(args.train_batch_size / args.accumulate_gradients)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -497,7 +460,7 @@ def main():
     processor = processors[task_name]()
     label_list = processor.get_labels()
 
-    tokenizer = tokenization.FullTokenizer(
+    tokenizer = tokenization_ch.FullTokenizer(
         vocab_file=args.vocab_file, do_lower_case=args.do_lower_case)
 
     train_examples = None
@@ -505,36 +468,26 @@ def main():
     if args.do_train:
         train_examples = processor.get_train_examples(args.data_dir)
         num_train_steps = int(
-            len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps * args.num_train_epochs)
+            len(train_examples) / args.train_batch_size * args.num_train_epochs)
 
-    # Prepare model
     model = BertForSequenceClassification(bert_config, len(label_list))
     if args.init_checkpoint is not None:
         model.bert.load_state_dict(torch.load(args.init_checkpoint, map_location='cpu'))
-    if args.fp16:
-        model.half()
     model.to(device)
+
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
                                                           output_device=args.local_rank)
     elif n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Prepare optimizer
-    if args.fp16:
-        param_optimizer = [(n, param.clone().detach().to('cpu').float().requires_grad_()) \
-                            for n, param in model.named_parameters()]
-    elif args.optimize_on_cpu:
-        param_optimizer = [(n, param.clone().detach().to('cpu').requires_grad_()) \
-                            for n, param in model.named_parameters()]
-    else:
-        param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'gamma', 'beta']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if n not in no_decay], 'weight_decay_rate': 0.01},
-        {'params': [p for n, p in param_optimizer if n in no_decay], 'weight_decay_rate': 0.0}
+    optimizer_parameters = [
+        {'params': [p for n, p in model.named_parameters() if n not in no_decay], 'weight_decay_rate': 0.01},
+        {'params': [p for n, p in model.named_parameters() if n in no_decay], 'weight_decay_rate': 0.0}
         ]
-    optimizer = BERTAdam(optimizer_grouped_parameters,
+
+    optimizer = BERTAdam(optimizer_parameters,
                          lr=args.learning_rate,
                          warmup=args.warmup_proportion,
                          t_total=num_train_steps)
@@ -547,10 +500,12 @@ def main():
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_steps)
+
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
         all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
+
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
@@ -568,10 +523,6 @@ def main():
                 loss, _ = model(input_ids, segment_ids, input_mask, label_ids)
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
-                if args.fp16 and args.loss_scale != 1.0:
-                    # rescale loss for fp16 training
-                    # see https://docs.nvidia.com/deeplearning/sdk/mixed-precision-training/index.html
-                    loss = loss * args.loss_scale
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
                 loss.backward()
@@ -579,21 +530,7 @@ def main():
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    if args.fp16 or args.optimize_on_cpu:
-                        if args.fp16 and args.loss_scale != 1.0:
-                            # scale down gradients for fp16 training
-                            for param in model.parameters():
-                                param.grad.data = param.grad.data / args.loss_scale
-                        is_nan = set_optimizer_params_grad(param_optimizer, model.named_parameters(), test_nan=True)
-                        if is_nan:
-                            logger.info("FP16 TRAINING: Nan in gradients, reducing loss scaling")
-                            args.loss_scale = args.loss_scale / 2
-                            model.zero_grad()
-                            continue
-                        optimizer.step()
-                        copy_optimizer_params_to_model(model.named_parameters(), param_optimizer)
-                    else:
-                        optimizer.step()
+                    optimizer.step()    # We have accumulated enought gradients
                     model.zero_grad()
                     global_step += 1
 
@@ -601,13 +538,16 @@ def main():
         eval_examples = processor.get_dev_examples(args.data_dir)
         eval_features = convert_examples_to_features(
             eval_examples, label_list, args.max_seq_length, tokenizer)
+
         logger.info("***** Running evaluation *****")
         logger.info("  Num examples = %d", len(eval_examples))
         logger.info("  Batch size = %d", args.eval_batch_size)
+
         all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
         all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.long)
+
         eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
         if args.local_rank == -1:
             eval_sampler = SequentialSampler(eval_data)
